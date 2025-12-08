@@ -1,0 +1,407 @@
+#!/bin/bash
+set -e
+
+# Applies a highly restrictive network setup in which only squid (80,443), dnsmasq (53) and chrony (123)
+# are allowed outgoing external network access.
+# This is facilitated via the iptables --uid-owner $USER [dnsmasq|_chrony|proxy]
+
+# TODO - verify chain doesn't already exist before re-adding
+# TODO - get ssh allow users to work with perm settings
+
+PROJDIR="$( realpath $0 | xargs dirname )"
+DEFAULT_ROUTE=$(ip route | grep '^default' | head -1)
+INTERFACE=$(echo "$DEFAULT_ROUTE" | awk '{print $5}')
+
+if [ -z "${INTERFACE}" ]; then
+    echo "ERROR: Could not detect default network interface."
+    exit 1
+else
+    echo "Detected primary interface: $INTERFACE"
+fi
+
+# For ufw/iptables config
+ALLOW_CHAIN="ALLOW-OUT-${INTERFACE}"
+DENY_CHAIN="DENY-OUT-${INTERFACE}"
+RULES_FILE="/etc/ufw/before.rules.d/60-transparent-proxy-lockdown.rules"
+
+# For squid blacklist management
+CACHE_LOG_FILEPATH=".access_log_filepath"
+CONFDIR="/etc/squid"
+BLACKLIST="$CONFDIR/blacklist_domains.txt"
+ACCESS_LOG=""
+
+PROXY_USER=proxy
+DNS_USER=dnsmasq
+NTP_USER=_chrony
+
+
+#
+# Commands used throughout script
+#
+
+_require_root()
+{
+    if [ "$USER" != "root" ]; then
+        echo "ERROR: root permissions are required"
+        exit 1
+    fi
+}
+
+_install_deps()
+{
+    _require_root
+    apt install squid dnsmasq chrony ufw > /dev/null 2>&1
+
+    # verify the expected users exist
+    ( grep -q $PROXY_USER /etc/shadow \
+        && grep -q $DNS_USER /etc/shadow \
+        && grep -q $NTP_USER /etc/shadow ) \
+        || ( echo "ERROR: Unable to determine users for service." && exit 1 )
+}
+
+_start_required_services()
+{
+    _require_root
+    service chrony start
+    service dnsmasq start
+    service squid start
+    chattr -i /etc/resolv.conf > /dev/null 2>&1
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
+    chattr +i /etc/resolv.conf > /dev/null 2>&1
+    ufw default deny outgoing on $INTERFACE
+}
+
+_prompt_allow_ssh_user()
+{
+    _require_root
+    echo "Would you like to enable outgoing SSH access for any users?"
+    echo "    0) Add a new user"
+    ulist=""
+    for u in $( users | sed 's/\ /\n/g' | sort | uniq )
+    do
+        echo "    1) $u"
+        ulist="$ulist $u"
+    done
+    read -p "Selection: " F_INPUT
+    if [ "$F_INPUT" = "0" ]; then
+        echo 'no.'
+        exit 1
+    else
+        allow_user="$( echo "$ulist" | awk '{ print $'$F_INPUT' }' )"
+        echo "Allowing SSH for user: ${allow_user}"
+        iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 22 -m owner --uid-owner "${allow_user}" -j ACCEPT
+        exit 0
+    fi
+}
+
+
+#
+# Functions for reporting on squid domains being blocked or access, as well as allowing
+# quick access to blocking or unblocking domains from a squid blacklist.
+#
+
+_require_access_log()
+{
+    # Check for existing input for the squid access_log filepath
+    if [ -f ".access_log_filepath" ] ; then
+        ACCESS_LOG="$(cat "${PROJDIR}/${CACHE_LOG_FILEPATH}")"
+    fi
+
+    # Try guessing
+    local log_filepath="$( ps -u $PROXY_USER -o args= | grep 'access.log' | cut -d ' ' -f 2 )"
+    if [ -f "${log_filepath}" ]; then
+        ACCESS_LOG="${log_filepath}"
+    fi
+    
+    # Required input of access_log location, can be previously set by config file, etc
+    if [ -z "${ACCESS_LOG}" ] || [ ! -f "${ACCESS_LOG}" ]; then
+        read -p "Squid Log file location: " F_INPUT
+        if [ -f "${F_INPUT}" ]; then
+            echo "Using ${F_INPUT}"
+            echo "${F_INPUT}" > "${PROJDIR}/$CACHE_LOG_FILEPATH"
+            ACCESS_LOG="${F_INPUT}"
+        else
+            echo "File not found."
+            exit 1
+        fi
+    fi
+}
+
+_prompt_squid_restart()
+{
+    # $1 = message proceeding prompt
+    if [ "$1" != "" ]; then
+        echo "$1"
+    fi
+
+    read -p "Continue with service restart? (y/n): " F_INPUT
+    if [ "${F_INPUT}" = "y" ] || [ "${F_INPUT}" = "Y" ]; then
+        service squid restart
+    fi
+}
+
+
+allow_domain()
+{
+    if [ "${1}" = "" ] || [ "${1}" = "-h" ]; then
+        echo "  allow [DOMAIN]"
+        echo "      Where DOMAIN matches an entry in the squid blacklist."
+        echo "      Example: .google.com"
+        exit 0
+    fi
+
+    # Check that the $1 is in the file
+    if [ -f "${BLACKLIST}" ]; then
+        grep -q "${1}" "${BLACKLIST}" || (echo "Domain $1 is not blacklisted." && exit 1)
+    fi
+
+    sed -i -e 's/'$1'//g' "${BLACKLIST}" \
+        && _prompt_squid_restart "Squid must restart for changes to be applied."
+}
+
+
+deny_domain()
+{
+    if [ "${1}" = "" ] || [ "${1}" = "-h" ]; then
+        echo "  deny [DOMAIN]"
+        echo "      Where DOMAIN can include sub-domains by prepending it with a period."
+        echo "      Example: .google.com vs. google.com - where the form blacklists all sub-domains as well."
+        exit 0
+    fi
+
+    # Check that the $1 isn't already in the file
+    if [ -f "${BLACKLIST}" ]; then
+        grep -q "${1}" "${BLACKLIST}" && echo "Domain $1 is already blacklisted." && exit 1
+    fi
+
+    echo "${1}" >> "${BLACKLIST}"
+    if [ "$?" != "0" ]; then
+        echo "WARNING: failed to blacklist $1"
+        exit 1
+    else
+        _prompt_squid_restart "Squid must restart for changes to be appplied."
+    fi
+}
+
+
+print_top_domains()
+{
+    if [ "${1}" = "-h" ]; then
+        echo "  squid-top-domains [LIMIT]"
+        echo "      List top domains access in squid logs."
+        exit 0
+    fi
+
+    # Strip extension from filepath to allow wildcard to include .log.1, .log.2, etc
+    local access_logs="$(dirname $ACCESS_LOG)/$(basename $ACCESS_LOG .log)"
+    local limit=2000
+
+    if [ ! -z "$1" ]; then
+        limit=$1
+    fi
+    
+    # numbered; idea being for selection to add to blacklist
+    grep 'TCP_TUNNEL' "${access_logs}".* \
+        | awk '{ print $7 }' \
+        | sort | uniq -c | sort -n \
+        | awk '{ lc++ }  { print lc "    ("$1") "$2 }'
+}
+
+
+print_denied_domains()
+{
+    if [ "${1}" = "-h" ]; then
+        echo "  squid-denied-domains [LIMIT]"
+        echo "      List top denied domains rejected access in squid logs."
+        exit 0
+    fi
+
+    # Strip extension from filepath to allow wildcard to include .log.1, .log.2, etc
+    local access_logs="$(dirname $ACCESS_LOG)/$(basename $ACCESS_LOG .log)"
+    local limit=2000
+ 
+    if [ ! -z "$1" ]; then
+        limit=$1
+    fi
+
+    # numbered; idea being for selection to add to blacklist
+    grep 'TCP_DENIED' "${access_logs}".* \
+        | awk '{ print $7 }' \
+        | sort | uniq -c | sort -n \
+        | awk '{ lc++ }  { print lc "    ("$1") "$2 }'
+}
+
+
+#
+# Util interface commmands 
+#
+
+list_services()
+{
+    echo "List of services to enable outgoing access to:"
+    echo "    0) ssh"
+    read -p "Selection: " F_INPUT
+    if [ "$F_INPUT" = "0" ]; then
+        _prompt_allow_ssh_user
+    fi
+}
+
+
+#
+# iptable modifications to restrict local access to external networks except
+# through squid, dnsmasq
+#
+
+apply_live() {
+    _install_deps
+
+    echo "Applying LIVE (non-persistent) locked-down mode..."
+    
+    iptables -F $ALLOW_CHAIN 2>/dev/null || iptables -N $ALLOW_CHAIN
+    iptables -F $DENY_CHAIN  2>/dev/null || iptables -N $DENY_CHAIN
+
+    # Remove old jumps if they exist
+    iptables -D ufw-before-output -o "$INTERFACE" -j $ALLOW_CHAIN 2>/dev/null || true
+    iptables -D ufw-before-output -o "$INTERFACE" -j $DENY_CHAIN  2>/dev/null || true
+
+    # Jump from UFW's chain into ours
+    iptables -A ufw-before-output -o "$INTERFACE" -j $ALLOW_CHAIN
+    iptables -A ufw-before-output -o "$INTERFACE" -j $DENY_CHAIN
+
+    # === Your actual allow rules (copy-paste exactly from your working set) ===
+    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp -m multiport --dports 80,443 -m owner --uid-owner $PROXY_USER -j ACCEPT
+    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
+    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
+    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
+    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
+    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 123 -m owner --uid-owner $NTP_USER -j ACCEPT
+
+    _prompt_allow_ssh_user
+
+    # ICMP for Path MTU (uncomment if you want it)
+    # iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p icmp --icmp-type 8 -j ACCEPT
+
+    # Final drop everything else
+    iptables -A $DENY_CHAIN -j DROP
+
+    _start_required_services
+    echo "Locked-down mode is now ACTIVE (non-persistent – reboot to remove)"
+}
+
+remove_live() {
+    _require_root
+    echo "Removing temporary locked-down rules..."
+    iptables -D ufw-before-output -o "$INTERFACE" -j $ALLOW_CHAIN 2>/dev/null || true
+    iptables -D ufw-before-output -o "$INTERFACE" -j $DENY_CHAIN  2>/dev/null || true
+    iptables -F $ALLOW_CHAIN 2>/dev/null || true
+    iptables -X $ALLOW_CHAIN 2>/dev/null || true
+    iptables -F $DENY_CHAIN  2>/dev/null || true
+    iptables -X $DENY_CHAIN  2>/dev/null || true
+    echo "Back to normal UFW rules"
+}
+
+commit_rules()
+{
+    _install_deps
+    RULES_CONTENT="*filter
+:ALLOW-OUT-$INTERFACE - [0:0]
+:DENY-OUT-$INTERFACE - [0:0]
+-A ufw-before-output -o $INTERFACE -j ALLOW-OUT-$INTERFACE
+-A ufw-before-output -o $INTERFACE -j DENY-OUT-$INTERFACE
+# ... (your specific rules) ...
+-A DENY-OUT-$INTERFACE -j DROP
+
+-F $ALLOW_CHAIN 2>/dev/null || iptables -N $ALLOW_CHAIN
+-F $DENY_CHAIN  2>/dev/null || iptables -N $DENY_CHAIN
+
+# Remove old jumps if they exist
+-D ufw-before-output -o "$INTERFACE" -j $ALLOW_CHAIN 2>/dev/null || true
+-D ufw-before-output -o "$INTERFACE" -j $DENY_CHAIN  2>/dev/null || true
+
+# Jump from UFW's chain into ours
+-A ufw-before-output -o "$INTERFACE" -j $ALLOW_CHAIN
+-A ufw-before-output -o "$INTERFACE" -j $DENY_CHAIN
+
+# === Your actual allow rules (copy-paste exactly from your working set) ===
+ -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp -m multiport --dports 80,443 -m owner --uid-owner $PROXY_USER -j ACCEPT
+ -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
+ -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
+ -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
+ -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
+ -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 123 -m owner --uid-owner $NTP_USER -j ACCEPT
+# ICMP for Path MTU (uncomment if you want it)
+#-A $ALLOW_CHAIN -o "$INTERFACE" -p icmp --icmp-type 8 -j ACCEPT
+
+# Final drop everything else
+-A $DENY_CHAIN -j DROP
+COMMIT"
+
+    echo "$RULES_CONTENT" | tee "$RULES_FILE" > /dev/null
+    echo "Permanent rules written to $RULES_FILE"
+    
+    _start_required_services
+
+    ufw enable > /dev/null 2>&1
+    ufw reload
+}
+
+
+case "$1" in
+    on|temp|live)
+        apply_live
+        ;;
+    off)
+        remove_live
+        ;;
+    commit|permanent)
+        commit_rules
+        ;;
+    services)
+        list_services
+        ;;
+    deny|squid-deny)
+        _require_access_log
+        deny_domain $*
+        ;;
+    allow|squid-allow)
+        _require_access_log
+        allow_domain $*
+        ;;
+    squid-top-domains|squidtopdomains)
+        _require_access_log
+        print_top_domains $*
+        ;;
+    squid-denied-domains|squid-denied-domains)
+        _require_access_log
+        print_denied_domains $*
+        ;;
+    status)
+        echo "=== Firewall Status ==="
+        if [ "$USER" != "root" ]; then
+            echo "Information Not Availble - requires root permission."
+        else 
+            iptables -L ALLOW-OUT-$INTERFACE -nv 2>/dev/null || echo "Rules not active."
+        fi
+        echo ""
+        echo "=== Proxy Status ===" 
+        service squid status | head -3
+        echo ""
+        echo "=== Configured Proxy Endpoint ==="
+        echo "HTTP Proxy: 127.0.0.1:3128"
+        ;;
+    *)
+        echo "Usage: $0 {on|temp|live|off|commit|permanent}"
+        echo "  on/temp/live    apply now, gone on reboot"
+        echo "  off             remove temporary rules"
+        echo "  commit          make it permanent (survives reboot)"
+        echo "  status          show the current configuration status"
+        echo "  services        list services to enable outgoing access to"
+        echo ""
+        echo "Available squid actions:"
+        echo "$(deny_domain -h)"
+        echo "$(allow_domain -h)"
+        echo "$(print_top_domains -h)"
+        echo "$(print_denied_domains -h)"
+        exit 1
+        ;;
+esac
