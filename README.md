@@ -13,6 +13,7 @@ Unlike transparent proxy setups, Calamari takes a **hardened approach**:
 This is ideal for: 
 - High-security workstations
 - Preventing software telemetry/data exfiltration
+- Being silent like mouse on internet
 
 ## ⚠️ Critical Warning
 
