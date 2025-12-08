@@ -57,6 +57,14 @@ _install_deps()
         && grep -q $DNS_USER /etc/shadow \
         && grep -q $NTP_USER /etc/shadow ) \
         || ( echo "ERROR: Unable to determine users for service." && exit 1 )
+
+    squid_conf=/etc/squid/squid.conf
+    if [ -f "$squid_conf" ]; then
+        cp $squid_conf $squid_conf".orig"
+        cp "${PROJDIR}/config/squid.conf.example" $squid_conf
+        cp "${PROJDIR}/config/blacklist_domains.txt" "$( dirname $squid_conf )"
+        service squid restart
+    fi
 }
 
 _start_required_services()
