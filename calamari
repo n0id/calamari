@@ -70,6 +70,7 @@ _install_deps()
         # Append logging directives
         echo "log-queries" >> "$dns_conf"
         echo "log-facility=$DNS_LOG" >> "$dns_conf"
+        sed -i 's/# server=10.1.2.3@eth1/server=8.8.8.8/' "$DNS_LOG"
         service dnsmasq restart
         # @TODO - log rotate?
     fi
