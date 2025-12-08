@@ -6,7 +6,7 @@ A security-focused tool that implements an **extremely restrictive** network env
 
 Unlike transparent proxy setups, Calamari takes a **hardened approach**:
 - **Default Deny**: No process can reach the internet unless explicitly configured
-- **No Leaks**: Even if malware executes, it cannot discover or access internet connectivity
+- **No Leaks**: Even if malware executes, it likely cannot discover or access internet connectivity
 - **Intentional Access**: Applications must be explicitly configured with proxy settings (e.g., `http_proxy`, `https_proxy` environment variables)
 - **Process Isolation**: Only specific service users (proxy, dnsmasq, chrony) have raw network access
 
@@ -29,7 +29,7 @@ This tool will **block all outgoing internet access** except through the configu
 - **Proxy-Only Internet**: Internet access ONLY via explicit proxy configuration
 - **DNS Control**: All DNS forced through local DNSMasq
 - **Service Isolation**: Only proxy, DNS, and NTP service users can make outbound connections
-- **Selective Exceptions**: Optionally allow SSH for specific users
+- **Selective Exceptions**: Optionally allow outgoing SSH for specific users
 - **Domain Blacklisting**: Granular control over what domains Squid permits
 - **Audit Logging**: Full visibility into all internet access attempts
 - **Temporary Testing**: Apply rules temporarily or commit permanently
