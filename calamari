@@ -5,9 +5,6 @@ set -e
 # are allowed outgoing external network access.
 # This is facilitated via the iptables --uid-owner $USER [dnsmasq|_chrony|proxy]
 
-# TODO - verify chain doesn't already exist before re-adding
-# TODO - get ssh allow users to work with perm settings
-
 PROJDIR="$( realpath $0 | xargs dirname )"
 DEFAULT_ROUTE=$(ip route | grep '^default' | head -1)
 INTERFACE=$(echo "$DEFAULT_ROUTE" | awk '{print $5}')
@@ -34,7 +31,6 @@ DNS_LOG="/var/log/dnsmasq.log"
 PROXY_USER=proxy
 DNS_USER=dnsmasq
 NTP_USER=_chrony
-
 
 
 #
