@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
 # Applies a highly restrictive network setup in which only squid (80,443), dnsmasq (53) and chrony (123)
@@ -29,10 +29,12 @@ CACHE_LOG_FILEPATH=".access_log_filepath"
 CONFDIR="/etc/squid"
 BLACKLIST="$CONFDIR/blacklist_domains.txt"
 ACCESS_LOG=""
+DNS_LOG="/var/log/dnsmasq.log"
 
 PROXY_USER=proxy
 DNS_USER=dnsmasq
 NTP_USER=_chrony
+
 
 
 #
@@ -58,12 +60,22 @@ _install_deps()
         && grep -q $NTP_USER /etc/shadow ) \
         || ( echo "ERROR: Unable to determine users for service." && exit 1 )
 
-    squid_conf=/etc/squid/squid.conf
+    local squid_conf="/etc/squid/squid.conf"
     if [ -f "$squid_conf" ]; then
         cp $squid_conf $squid_conf".orig"
         cp "${PROJDIR}/config/squid.conf.example" $squid_conf
         cp "${PROJDIR}/config/blacklist_domains.txt" "$( dirname $squid_conf )"
         service squid restart
+    fi
+    
+    local dns_conf="/etc/dnsmasq.conf"
+    if [ -f "$dns_conf" ]; then
+        cp "$dns_conf" "${dns_conf}.backup.$(date +%Y%m%d)"
+        # Append logging directives
+        echo "log-queries" >> "$dns_conf"
+        echo "log-facility=$DNS_LOG" >> "$dns_conf"
+        service dnsmasq restart
+        # @TODO - log rotate?
     fi
 }
 
@@ -254,6 +266,64 @@ list_services()
     fi
 }
 
+show_dns_stats() {
+    _require_root
+    local target_domain="${1}"
+    local log_file="$DNS_LOG"
+
+    if [ ! -f "$log_file" ]; then
+        echo "DNS log file not found. Is dnsmasq logging enabled?"
+        return 1
+    fi
+
+    echo "=== DNS Query Statistics ==="
+    if [ -n "$target_domain" ]; then
+        echo "Focusing on domain: $target_domain"
+        grep "query\[A\] $target_domain" "$log_file" | \
+            awk '{print $8}' | sort | uniq -c | sort -rn | head -20
+    else
+        # Show top domains overall
+        awk '/query\[A\]/ {print $8}' "$log_file" | \
+            cut -d. -f2- | sort | uniq -c | sort -rn | head -20
+    fi
+}
+
+audit_dns_queries() {
+    _require_root
+    local log_file="$DNS_LOG"
+    local alert_threshold=100  # Adjust as needed
+
+    if [ ! -f "$log_file" ]; then
+        echo "DNS log file not found."
+        return 1
+    fi
+
+    echo "=== DNS Exfiltration Anomaly Check ==="
+
+    # Check for very long subdomains (potential data encoding)
+    echo "Checking for unusually long subdomains..."
+    awk '/query\[A\]/ && length($8) > 80 {print "LONG:", $8}' "$log_file" | head -10
+
+    # Check for high entropy/Base64-like patterns
+    echo "Checking for high-entropy subdomains..."
+    grep -oE 'query\[A\] [^ ]+' "$log_file" | \
+        awk '{print $2}' | grep -E '[a-zA-Z0-9+/=]{20,}' | \
+        head -10 | sed 's/^/ENTROPY: /'
+
+    # Alert on sudden volume spikes (last 10 minutes)
+    echo "Checking recent query volume..."
+    recent_count=$(find "$log_file" -mmin -10 -exec grep -c 'query\[A\]' {} \; 2>/dev/null)
+    if [ "$recent_count" -gt "$alert_threshold" ]; then
+        echo "ALERT: High DNS query volume detected: $recent_count queries in last 10 minutes"
+    fi
+
+    # Show suspicious TLDs
+    echo "Checking for unusual TLDs..."
+    awk '/query\[A\]/ {print $8}' "$log_file" | \
+        rev | cut -d. -f1 | rev | sort | uniq -c | \
+        grep -E -v 'com|net|org|io|local' | sort -rn | head -5
+}
+
 
 #
 # iptable modifications to restrict local access to external networks except
@@ -369,24 +439,30 @@ case "$1" in
         ;;
     deny|squid-deny)
         _require_access_log
-        deny_domain $*
+        deny_domain $2 $3
         ;;
     allow|squid-allow)
         _require_access_log
-        allow_domain $*
+        allow_domain $2 $3
         ;;
     squid-top-domains|squidtopdomains)
         _require_access_log
-        print_top_domains $*
+        print_top_domains $2 $3
         ;;
     squid-denied-domains|squid-denied-domains)
         _require_access_log
-        print_denied_domains $*
+        print_denied_domains $2 $3
+        ;;
+    dns-audit)
+        audit_dns_queries
+        ;;
+    dns-stats)
+        show_dns_stats $2  # Pass a domain as optional argument
         ;;
     status)
         echo "=== Firewall Status ==="
         if [ "$USER" != "root" ]; then
-            echo "Information Not Availble - requires root permission."
+            echo "Information Not Available - requires root permission."
         else 
             iptables -L ALLOW-OUT-$INTERFACE -nv 2>/dev/null || echo "Rules not active."
         fi
@@ -404,6 +480,8 @@ case "$1" in
         echo "  commit          make it permanent (survives reboot)"
         echo "  status          show the current configuration status"
         echo "  services        list services to enable outgoing access to"
+        echo "  dns-audit       basic check for obvious DNS Exfiltration attempts"
+        echo "  dns-stats       show DNS stats"
         echo ""
         echo "Available squid actions:"
         echo "$(deny_domain -h)"
