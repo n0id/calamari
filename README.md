@@ -10,9 +10,7 @@ Unlike transparent proxy setups, Calamari takes a **hardened approach**:
 - **Intentional Access**: Applications must be explicitly configured with proxy settings (e.g., `http_proxy`, `https_proxy` environment variables)
 - **Process Isolation**: Only specific service users (proxy, dnsmasq, chrony) have raw network access
 
-This is ideal for:
-- Malware analysis sandboxes
-- Security research environments  
+This is ideal for: 
 - High-security workstations
 - Preventing software telemetry/data exfiltration
 
