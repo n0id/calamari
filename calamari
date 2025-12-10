@@ -10,13 +10,6 @@ DEFAULT_ROUTE=$(ip route | grep '^default' | head -1)
 ROUTE_ADDR=$(echo "$DEFAULT_ROUTE" | awk '{print $3}')
 INTERFACE=$(echo "$DEFAULT_ROUTE" | awk '{print $5}')
 
-if [ -z "${INTERFACE}" ]; then
-    echo "ERROR: Could not detect default network interface."
-    exit 1
-else
-    echo "Detected primary interface: $INTERFACE"
-fi
-
 # For ufw/iptables config
 ALLOW_CHAIN="ALLOW-OUT-${INTERFACE}"
 DENY_CHAIN="DENY-OUT-${INTERFACE}"
@@ -32,7 +25,6 @@ DNS_LOG="/var/log/dnsmasq.log"
 PROXY_USER=proxy
 DNS_USER=dnsmasq
 NTP_USER=_chrony
-
 
 #
 # Commands used throughout script
@@ -346,7 +338,8 @@ list_services()
     fi
 }
 
-show_dns_stats() {
+show_dns_stats()
+{
     _require_root
     local target_domain="${1}"
     local log_file="$DNS_LOG"
@@ -368,7 +361,8 @@ show_dns_stats() {
     fi
 }
 
-audit_dns_queries() {
+audit_dns_queries()
+{
     _require_root
     local log_file="$DNS_LOG"
     local alert_threshold=100  # Adjust as needed
@@ -393,7 +387,7 @@ audit_dns_queries() {
     # Alert on sudden volume spikes (last 10 minutes)
     echo "Checking recent query volume..."
     recent_count=$(find "$log_file" -mmin -10 -exec grep -c 'query\[A\]' {} \; 2>/dev/null)
-    if [ "$recent_count" -gt "$alert_threshold" ]; then
+    if [ -n "${recent_count}" ] && [ "$recent_count" -gt "$alert_threshold" ]; then
         echo "ALERT: High DNS query volume detected: $recent_count queries in last 10 minutes"
     fi
 
@@ -410,7 +404,8 @@ audit_dns_queries() {
 # through squid, dnsmasq
 #
 
-apply_live() {
+apply_live()
+{
     _install_deps
     remove_live > /dev/null 2>&1
     yes | ufw reset > /dev/null 2>&1
@@ -483,7 +478,8 @@ apply_live() {
     echo "Locked-down mode is now ACTIVE (non-persistent – reboot to remove)"
 }
 
-remove_live() {
+remove_live()
+{
     _require_root
     echo "Removing temporary locked-down rules..."
     iptables -D ufw-before-output -o "$INTERFACE" -j $ALLOW_CHAIN 2>/dev/null || true
@@ -494,6 +490,14 @@ remove_live() {
     iptables -X $DENY_CHAIN  2>/dev/null || true
     echo "Back to normal UFW rules"
 }
+
+
+if [ -z "${INTERFACE}" ]; then
+    echo "ERROR: Could not detect default network interface."
+    exit 1
+else
+    echo "Detected primary interface: $INTERFACE"
+fi
 
 
 case "$1" in
