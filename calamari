@@ -49,7 +49,15 @@ _require_root()
 _install_deps()
 {
     _require_root
-    apt install squid dnsmasq chrony ufw > /dev/null 2>&1
+    local run_install=0
+    which ufw > /dev/null 2>&1 || run_install=1
+    which squid > /dev/null 2>&1 || run_install=1
+    which dnsmasq > /dev/null 2>&1 || run_install=1
+    which chronyc > /dev/null 2>&1 || run_install=1
+    
+    if [ "$run_install" = "1" ]; then
+        apt install squid dnsmasq chrony ufw > /dev/null 2>&1
+    fi
 
     # verify the expected users exist
     ( grep -q $PROXY_USER /etc/shadow \
@@ -59,23 +67,40 @@ _install_deps()
 
     local squid_conf="/etc/squid/squid.conf"
     if [ -f "$squid_conf" ]; then
-        cp $squid_conf $squid_conf".orig"
-        cp "${PROJDIR}/config/squid.conf.example" $squid_conf
-        cp "${PROJDIR}/config/blacklist_domains.txt" "$( dirname $squid_conf )"
-        service squid restart
+        local new_squid_conf="${PROJDIR}/config/squid.conf.example"
+        if ! cmp --silent $squid_conf "$new_squid_conf"; then
+            echo "Current Squid config file doesn't match calamari settings."
+            read -p "Replace it? (y/n): " F_INPUT
+            if [ "${F_INPUT}" = "y" ] || [ "${F_INPUT}" = "Y" ]; then
+                cp $squid_conf $squid_conf".orig"
+                cp "${PROJDIR}/config/squid.conf.example" $squid_conf
+                cp "${PROJDIR}/config/blacklist_domains.txt" "$( dirname $squid_conf )"
+                echo -n "Restarting squid..."
+                service squid restart
+                echo " done."
+            fi
+        fi
     fi
     
     local dns_conf="/etc/dnsmasq.conf"
-    if [ -f "$dns_conf" ]; then
+    local restart_dnsmasq=0
+    if [ ! -f "$dns_conf" ]; then
+        echo "ERROR: Missing dnsmasq.conf file."
+        exit 1
+    fi
+    if ! grep -q ^server= "$dns_conf"; then
+        sed -i 's/# server=10.1.2.3@eth1/server=8.8.8.8/' "$dns_conf"
+        restart_dnsmasq=1
+    fi
+    if ! grep -q ^log-queries "$dns_conf"; then
         cp "$dns_conf" "${dns_conf}.backup.$(date +%Y%m%d)"
         # Append logging directives
         echo "log-queries" >> "$dns_conf"
         echo "log-facility=$DNS_LOG" >> "$dns_conf"
-        if [ -z "$(grep "^server=" "$dns_conf")" ]; then
-            sed -i 's/# server=10.1.2.3@eth1/server=8.8.8.8/' "$dns_conf"
-        fi
+        restart_dnsmasq=1
+    fi
+    if [ "$restart_dnsmasq" = "1" ]; then
         service dnsmasq restart
-        # @TODO - log rotate?
     fi
 }
 
@@ -334,7 +359,6 @@ apply_live() {
     remove_live > /dev/null 2>&1
     yes | ufw reset > /dev/null 2>&1
     ufw enable > /dev/null 2>&1
-
 
     echo "Applying LIVE (non-persistent) locked-down mode..."
     
