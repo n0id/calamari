@@ -1,24 +1,28 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 
 # Applies a highly restrictive network setup in which only squid (80,443), dnsmasq (53) and chrony (123)
 # are allowed outgoing external network access.
 # This is facilitated via the iptables --uid-owner $USER [dnsmasq|_chrony|proxy]
 
+# TODO - verify chain doesn't already exist before re-adding
+# TODO - get ssh allow users to work with perm settings
+
 PROJDIR="$( realpath $0 | xargs dirname )"
 DEFAULT_ROUTE=$(ip route | grep '^default' | head -1)
+ROUTE_ADDR=$(echo "$DEFAULT_ROUTE" | awk '{print $3}')
 INTERFACE=$(echo "$DEFAULT_ROUTE" | awk '{print $5}')
 
 if [ -z "${INTERFACE}" ]; then
     echo "ERROR: Could not detect default network interface."
     exit 1
 else
-    echo "Detected primary interface: $INTERFACE"
+    echo "Detected primary interface $INTERFACE and default route to $ROUTE_ADDR"
 fi
 
 # For ufw/iptables config
-ALLOW_CHAIN="ALLOW-OUT-${INTERFACE}"
-DENY_CHAIN="DENY-OUT-${INTERFACE}"
+ALLOW_CHAIN="ALLOW-OUT-$INTERFACE"
+DENY_CHAIN="DENY-OUT-$INTERFACE"
 RULES_FILE="/etc/ufw/before.rules.d/60-transparent-proxy-lockdown.rules"
 
 # For squid blacklist management
@@ -26,7 +30,6 @@ CACHE_LOG_FILEPATH=".access_log_filepath"
 CONFDIR="/etc/squid"
 BLACKLIST="$CONFDIR/blacklist_domains.txt"
 ACCESS_LOG=""
-DNS_LOG="/var/log/dnsmasq.log"
 
 PROXY_USER=proxy
 DNS_USER=dnsmasq
@@ -55,27 +58,6 @@ _install_deps()
         && grep -q $DNS_USER /etc/shadow \
         && grep -q $NTP_USER /etc/shadow ) \
         || ( echo "ERROR: Unable to determine users for service." && exit 1 )
-
-    local squid_conf="/etc/squid/squid.conf"
-    if [ -f "$squid_conf" ]; then
-        cp $squid_conf $squid_conf".orig"
-        cp "${PROJDIR}/config/squid.conf.example" $squid_conf
-        cp "${PROJDIR}/config/blacklist_domains.txt" "$( dirname $squid_conf )"
-        service squid restart
-    fi
-    
-    local dns_conf="/etc/dnsmasq.conf"
-    if [ -f "$dns_conf" ]; then
-        cp "$dns_conf" "${dns_conf}.backup.$(date +%Y%m%d)"
-        # Append logging directives
-        echo "log-queries" >> "$dns_conf"
-        echo "log-facility=$DNS_LOG" >> "$dns_conf"
-        if [ -z "$(grep "^server=" "$dns_conf")" ]; then
-            sed -i 's/# server=10.1.2.3@eth1/server=8.8.8.8/' "$dns_conf"
-        fi
-        service dnsmasq restart
-        # @TODO - log rotate?
-    fi
 }
 
 _start_required_services()
@@ -87,7 +69,6 @@ _start_required_services()
     chattr -i /etc/resolv.conf > /dev/null 2>&1
     echo "nameserver 127.0.0.1" > /etc/resolv.conf
     chattr +i /etc/resolv.conf > /dev/null 2>&1
-    ufw default deny outgoing on $INTERFACE
 }
 
 _prompt_allow_ssh_user()
@@ -109,7 +90,7 @@ _prompt_allow_ssh_user()
         allow_user="$( echo "$ulist" | awk '{ print $'$F_INPUT' }' )"
         echo "Allowing SSH for user: ${allow_user}"
         iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 22 -m owner --uid-owner "${allow_user}" -j ACCEPT
-        exit 0
+        return 0
     fi
 }
 
@@ -265,64 +246,6 @@ list_services()
     fi
 }
 
-show_dns_stats() {
-    _require_root
-    local target_domain="${1}"
-    local log_file="$DNS_LOG"
-
-    if [ ! -f "$log_file" ]; then
-        echo "DNS log file not found. Is dnsmasq logging enabled?"
-        return 1
-    fi
-
-    echo "=== DNS Query Statistics ==="
-    if [ -n "$target_domain" ]; then
-        echo "Focusing on domain: $target_domain"
-        grep "query\[A\] $target_domain" "$log_file" | \
-            awk '{print $8}' | sort | uniq -c | sort -rn | head -20
-    else
-        # Show top domains overall
-        awk '/query\[A\]/ {print $8}' "$log_file" | \
-            cut -d. -f2- | sort | uniq -c | sort -rn | head -20
-    fi
-}
-
-audit_dns_queries() {
-    _require_root
-    local log_file="$DNS_LOG"
-    local alert_threshold=100  # Adjust as needed
-
-    if [ ! -f "$log_file" ]; then
-        echo "DNS log file not found."
-        return 1
-    fi
-
-    echo "=== DNS Exfiltration Anomaly Check ==="
-
-    # Check for very long subdomains (potential data encoding)
-    echo "Checking for unusually long subdomains..."
-    awk '/query\[A\]/ && length($8) > 80 {print "LONG:", $8}' "$log_file" | head -10
-
-    # Check for high entropy/Base64-like patterns
-    echo "Checking for high-entropy subdomains..."
-    grep -oE 'query\[A\] [^ ]+' "$log_file" | \
-        awk '{print $2}' | grep -E '[a-zA-Z0-9+/=]{20,}' | \
-        head -10 | sed 's/^/ENTROPY: /'
-
-    # Alert on sudden volume spikes (last 10 minutes)
-    echo "Checking recent query volume..."
-    recent_count=$(find "$log_file" -mmin -10 -exec grep -c 'query\[A\]' {} \; 2>/dev/null)
-    if [ "$recent_count" -gt "$alert_threshold" ]; then
-        echo "ALERT: High DNS query volume detected: $recent_count queries in last 10 minutes"
-    fi
-
-    # Show suspicious TLDs
-    echo "Checking for unusual TLDs..."
-    awk '/query\[A\]/ {print $8}' "$log_file" | \
-        rev | cut -d. -f1 | rev | sort | uniq -c | \
-        grep -E -v 'com|net|org|io|local' | sort -rn | head -5
-}
-
 
 #
 # iptable modifications to restrict local access to external networks except
@@ -331,6 +254,9 @@ audit_dns_queries() {
 
 apply_live() {
     _install_deps
+    remove_live > /dev/null 2>&1
+    yes| ufw reset > /dev/null 2>&1
+    ufw enable > /dev/null 2>&1
 
     echo "Applying LIVE (non-persistent) locked-down mode..."
     
@@ -347,13 +273,19 @@ apply_live() {
 
     # === Your actual allow rules (copy-paste exactly from your working set) ===
     iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp -m multiport --dports 80,443 -m owner --uid-owner $PROXY_USER -j ACCEPT
-    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
-    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
+    # Use dnsmasq for DNS
+    # iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
+    # iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
     iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
     iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
     iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 123 -m owner --uid-owner $NTP_USER -j ACCEPT
+    # @TODO - narrow down to specific router ports+protocols?
+    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp -m owner --uid-owner root -d "$ROUTE_ADDR" -j ACCEPT
+    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp -m owner --uid-owner root -d "$ROUTE_ADDR" -j ACCEPT
+    # @TODO - add dnsmasq.conf including using default route for DNS is a query to it works?
 
     _prompt_allow_ssh_user
+    
 
     # ICMP for Path MTU (uncomment if you want it)
     # iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p icmp --icmp-type 8 -j ACCEPT
@@ -438,30 +370,24 @@ case "$1" in
         ;;
     deny|squid-deny)
         _require_access_log
-        deny_domain $2 $3
+        deny_domain $*
         ;;
     allow|squid-allow)
         _require_access_log
-        allow_domain $2 $3
+        allow_domain $*
         ;;
     squid-top-domains|squidtopdomains)
         _require_access_log
-        print_top_domains $2 $3
+        print_top_domains $*
         ;;
     squid-denied-domains|squid-denied-domains)
         _require_access_log
-        print_denied_domains $2 $3
-        ;;
-    dns-audit)
-        audit_dns_queries
-        ;;
-    dns-stats)
-        show_dns_stats $2  # Pass a domain as optional argument
+        print_denied_domains $*
         ;;
     status)
         echo "=== Firewall Status ==="
         if [ "$USER" != "root" ]; then
-            echo "Information Not Available - requires root permission."
+            echo "Information Not Availble - requires root permission."
         else 
             iptables -L ALLOW-OUT-$INTERFACE -nv 2>/dev/null || echo "Rules not active."
         fi
@@ -479,8 +405,6 @@ case "$1" in
         echo "  commit          make it permanent (survives reboot)"
         echo "  status          show the current configuration status"
         echo "  services        list services to enable outgoing access to"
-        echo "  dns-audit       basic check for obvious DNS Exfiltration attempts"
-        echo "  dns-stats       show DNS stats"
         echo ""
         echo "Available squid actions:"
         echo "$(deny_domain -h)"
