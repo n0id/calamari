@@ -139,7 +139,7 @@ _prompt_allow_ssh_user()
     if [ "$F_INPUT" = "0" ]; then
         echo 'no.'
         return 1
-    else
+    elif [ -n "$F_INPUT" ]; then
         allow_user="$( echo "$ulist" | awk '{ print $'$F_INPUT' }' )"
         echo "Allowing SSH for user: ${allow_user}"
         iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 22 -m owner --uid-owner "${allow_user}" -j ACCEPT
@@ -430,11 +430,41 @@ apply_live() {
     iptables -A ufw-before-output -o "$INTERFACE" -j $DENY_CHAIN
 
     # === Your actual allow rules (copy-paste exactly from your working set) ===
-    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp -m multiport --dports 80,443 -m owner --uid-owner $PROXY_USER -j ACCEPT
-    # iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
-    # iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
-    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
-    iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
+    if [ "$1" = "tor" ] ; then
+        which tor > /dev/null 2>&1
+        if [ "$?" != "0" ]; then
+            echo ""
+            echo "ERROR: Tor is not installed. Please install it first: apt install tor"
+            echo ""
+            echo "Note: If calamari is enabled in squid-mode, you may need to run './calamari off', or use:"
+            echo "  \$ env http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128 apt update && apt install tor"
+            echo ""
+            echo "WARNING: If a password is required, su as root for some protection, as the password will likely end up in your shell history."
+            echo ""
+            remove_live
+            exit 1
+        fi
+
+        # Start tor if not running
+        if ! service tor status >/dev/null 2>&1; then
+            service tor start > /dev/null 2>&1
+            sleep 2  # Give tor time to start
+        fi
+
+        tor_user="$(ps -eo user:20,pid,cmd | awk '/\/bin\/[t]or/ {print $1}')"
+
+        if [ -z "$tor_user" ]; then
+            echo "ERROR: Could not find running tor process."
+            echo "Check: service tor status"
+            exit 1
+        fi
+
+        iptables -A $ALLOW_CHAIN -o "$INTERFACE" -m owner --uid-owner $tor_user -j ACCEPT
+    else
+        iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp -m multiport --dports 80,443 -m owner --uid-owner $PROXY_USER -j ACCEPT
+        iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
+        iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
+    fi
     iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 123 -m owner --uid-owner $NTP_USER -j ACCEPT
     # @TODO - narrow down to specific ports+protocols?
     iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp -m owner --uid-owner root -d "$ROUTE_ADDR" -j ACCEPT
@@ -465,55 +495,13 @@ remove_live() {
     echo "Back to normal UFW rules"
 }
 
-commit_rules()
-{
-    _install_deps
-    RULES_CONTENT="*filter
-:ALLOW-OUT-$INTERFACE - [0:0]
-:DENY-OUT-$INTERFACE - [0:0]
--A ufw-before-output -o $INTERFACE -j ALLOW-OUT-$INTERFACE
--A ufw-before-output -o $INTERFACE -j DENY-OUT-$INTERFACE
-# ... (your specific rules) ...
--A DENY-OUT-$INTERFACE -j DROP
-
--F $ALLOW_CHAIN 2>/dev/null || iptables -N $ALLOW_CHAIN
--F $DENY_CHAIN  2>/dev/null || iptables -N $DENY_CHAIN
-
-# Remove old jumps if they exist
--D ufw-before-output -o "$INTERFACE" -j $ALLOW_CHAIN 2>/dev/null || true
--D ufw-before-output -o "$INTERFACE" -j $DENY_CHAIN  2>/dev/null || true
-
-# Jump from UFW's chain into ours
--A ufw-before-output -o "$INTERFACE" -j $ALLOW_CHAIN
--A ufw-before-output -o "$INTERFACE" -j $DENY_CHAIN
-
-# === Your actual allow rules (copy-paste exactly from your working set) ===
- -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp -m multiport --dports 80,443 -m owner --uid-owner $PROXY_USER -j ACCEPT
- -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
- -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $PROXY_USER -j ACCEPT
- -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
- -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 53 -m owner --uid-owner $DNS_USER -j ACCEPT
- -A $ALLOW_CHAIN -o "$INTERFACE" -p udp --dport 123 -m owner --uid-owner $NTP_USER -j ACCEPT
-# ICMP for Path MTU (uncomment if you want it)
-#-A $ALLOW_CHAIN -o "$INTERFACE" -p icmp --icmp-type 8 -j ACCEPT
-
-# Final drop everything else
--A $DENY_CHAIN -j DROP
-COMMIT"
-
-    echo "$RULES_CONTENT" | tee "$RULES_FILE" > /dev/null
-    echo "Permanent rules written to $RULES_FILE"
-    
-    _start_required_services
-
-    ufw enable > /dev/null 2>&1
-    ufw reload
-}
-
 
 case "$1" in
     on|temp|live)
-        apply_live
+        apply_live $2
+        ;;
+    tor)
+        apply_live "tor"
         ;;
     off)
         remove_live
@@ -546,6 +534,16 @@ case "$1" in
     dns-stats)
         show_dns_stats $2  # Pass a domain as optional argument
         ;;
+    test-tor)
+        if ! which torsocks >/dev/null 2>&1; then
+            echo "torsocks not installed, exiting..."
+            exit 1
+        fi
+        echo -n "Testing Tor connection... "
+        timeout 30 torsocks curl -s https://check.torproject.org/ 2>&1| \
+            grep -q -i "congratulations" && echo "✓ Tor is working!" || echo "✗ Tor connection failed"
+        
+        ;;
     status)
         echo "=== Firewall Status ==="
         if [ "$USER" != "root" ]; then
@@ -554,6 +552,20 @@ case "$1" in
             iptables -L ALLOW-OUT-$INTERFACE -nv 2>/dev/null || echo "Rules not active."
         fi
         echo ""
+        if service tor status > /dev/null 2>&1 ; then
+            echo "=== TOR Status ==="
+            echo "Tor user: $tor_user"
+            service tor status | head -3
+            echo ""
+            echo "=== Configured Proxy Endpoints ==="
+            echo "SOCKS5: 127.0.0.1:9050"
+            echo "Control: 127.0.0.1:9051"
+            echo "DNS: 127.0.0.1:9053 (if DNSPort enabled in /etc/tor/torrc)"
+            echo ""
+            echo "Test Tor connection:"
+            echo "  torsocks curl -s https://check.torproject.org/ | grep -i congratulations"
+            echo ""
+        fi
         echo "=== Proxy Status ===" 
         service squid status | head -3
         echo ""
@@ -562,16 +574,16 @@ case "$1" in
         echo "HTTP Proxy: 127.0.0.1:3128"
         ;;
     *)
-        echo "Usage: $0 {on|temp|live|off|commit|permanent}"
-        echo "  on/temp/live    apply now, gone on reboot"
-        echo "  off             remove temporary rules"
-        echo "  commit          make it permanent (survives reboot)"
-        echo "  status          show the current configuration status"
-        echo "  services        list services to enable outgoing access to"
-        echo "  dns-audit       basic check for obvious DNS Exfiltration attempts"
-        echo "  dns-stats       show DNS stats"
+        echo "Usage: $0 {on|temp|live|off|tor|status|services|...}"
+        echo "  on/temp/live [tor]  apply locked-down mode (add 'tor' for tor mode)"
+        echo "  tor                 shortcut for 'on tor'"
+        echo "  off                 remove temporary rules"
+        echo "  status              show the current configuration status"
+        echo "  services            list services to enable outgoing access to"
+        echo "  dns-audit           basic check for obvious DNS Exfiltration attempts"
+        echo "  dns-stats           show DNS stats"
         echo ""
-        echo "Available squid actions:"
+        echo "Proxy management:"
         echo "$(deny_domain -h)"
         echo "$(allow_domain -h)"
         echo "$(print_top_domains -h)"
