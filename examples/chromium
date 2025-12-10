@@ -1,0 +1,15 @@
+#!/bin/sh
+
+http_proxy=127.0.0.1:3128
+args=""
+
+if [ "$1" = "-t" ]; then
+    args=" --temp-profile"
+    shift
+fi
+
+if [ "$1" = "-i" ]; then
+    args="$args --incognito"
+fi
+
+chromium --proxy-server=$http_proxy $args
