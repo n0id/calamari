@@ -74,7 +74,11 @@ _install_deps()
             if [ "${F_INPUT}" = "y" ] || [ "${F_INPUT}" = "Y" ]; then
                 cp $squid_conf $squid_conf".orig"
                 cp "${PROJDIR}/config/squid.conf.example" $squid_conf
-                cp "${PROJDIR}/config/blacklist_domains.txt" "$( dirname $squid_conf )"
+                local blacklist_file="$( dirname $squid_conf )/blacklist_domains.txt"
+                if [ ! -f "${blacklist_file}" ]; then
+                    cp "${PROJDIR}/config/blacklist_domains.txt" "$( dirname $squid_conf )"
+                fi
+                _setup_squid_auth
                 echo -n "Restarting squid..."
                 service squid restart
                 echo " done."
@@ -136,6 +140,77 @@ _prompt_allow_ssh_user()
         iptables -A $ALLOW_CHAIN -o "$INTERFACE" -p tcp --dport 22 -m owner --uid-owner "${allow_user}" -j ACCEPT
         return 0
     fi
+}
+
+_setup_squid_auth() {
+    _require_root
+    local auth_type="basic"
+    local passwd_file="/etc/squid/passwords"
+    local squid_conf="/etc/squid/squid.conf"
+
+    read -p "Would you like to add basic password protection to proxy access? (y/n): " F_INPUT
+    if [ "${F_INPUT}" != "y" ] && [ "${F_INPUT}" != "Y" ]; then
+        return 0
+    fi
+
+    which htpasswd >/dev/null 2>&1 || apt install apache2-utils -y
+
+    echo "Creating/managing password file at $passwd_file"
+
+    if [ ! -f "$passwd_file" ]; then
+        touch "$passwd_file"
+        chown proxy:proxy "$passwd_file"
+        chmod 600 "$passwd_file"
+    fi
+
+    echo "Adding/updating user for Basic auth..."
+    read -p "Username: " username
+    htpasswd "$passwd_file" "$username"
+    
+    # Remove auth lines
+    sed -i 's/^#auth_param/auth_param/' "$squid_conf"
+    sed -i 's/^#acl authenticated/acl authenticated/' "$squid_conf"
+    #sed -i 's/^#http_access allow authenticated/http_access allow authenticated/' "$squid_conf"
+    sed -i 's/^http_access allow localhost manager/http_access allow authenticated/' "$squid_conf"
+}
+
+_remove_squid_auth() {
+    _require_root
+    echo "Removing Squid authentication..."
+
+    local squid_conf="/etc/squid/squid.conf"
+    local passwd_file="/etc/squid/passwords"
+
+    # Remove auth lines
+    sed -i '/^auth_param/#^auth_param/' "$squid_conf"
+    sed -i '/^acl authenticated/#acl authenticated/' "$squid_conf"
+    sed -i '/^http_access allow authenticated/#http_access allow authenticated/' "$squid_conf"
+
+    # Optionally remove password file
+    read -p "Remove password file too? (y/n): " remove_passwd
+    if [ "$remove_passwd" = "y" ] || [ "$remove_passwd" = "Y" ]; then
+        rm -f "$passwd_file"
+        echo "Password file removed."
+    fi
+
+    echo "Restarting squid..."
+    service squid restart
+    echo "Authentication removed. Squid is now open (within IP restrictions)."
+}
+
+_list_squid_users() {
+    local passwd_file="/etc/squid/passwords"
+
+    if [ ! -f "$passwd_file" ]; then
+        echo "No password file found. Authentication is not enabled."
+        return 0
+    fi
+
+    echo "=== Squid Proxy Users ==="
+    # Basic format: user:hash
+    echo "Basic authentication users:"
+    cut -d: -f1 "$passwd_file" | sort | uniq
+    echo ""
 }
 
 
@@ -501,6 +576,7 @@ case "$1" in
         echo "=== Proxy Status ===" 
         service squid status | head -3
         echo ""
+        _list_squid_users
         echo "=== Configured Proxy Endpoint ==="
         echo "HTTP Proxy: 127.0.0.1:3128"
         ;;
