@@ -103,6 +103,11 @@ _install_deps()
         echo "log-facility=$DNS_LOG" >> "$dns_conf"
         restart_dnsmasq=1
     fi
+    if ! grep -q ^interface= "$dns_conf"; then
+        sed -i 's/#interface=/interface=lo/' "$dns_conf"
+        sed -i 's/#bind-interfaces/bind-interfaces/' "$dns_conf"
+        restart_dnsmasq=1
+    fi
     if [ "$restart_dnsmasq" = "1" ]; then
         service dnsmasq restart
     fi
