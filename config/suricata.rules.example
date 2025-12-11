@@ -1,0 +1,255 @@
+# Add to /etc/suricata/rules/sliver-c2.rules
+
+alert http any any -> any 80 (
+    msg:"C2-Sliver: Suspicous Keywords detected in HTTP POST";
+    http.method; content:"POST";
+    http.uri; content:"php"; nocase;
+    
+    file.data; pcre:"
+/\x49\x43\x54\x45\x52\x49\x43\x41\x4c|
+\x53\x54\x41\x52\x46\x49\x53\x48|
+\x47\x55\x45\x53\x54\x49\x4e\x47|
+\x4f\x56\x45\x52\x4f\x52\x47\x41\x4e\x49\x5a\x45|
+\x43\x4f\x4e\x46\x45\x52\x4d\x45\x4e\x54\x53/";
+
+    classtype:trojan-activity;
+    sid:1000400;
+    rev:1;
+)
+
+
+# Monitor both HTTP and HTTPS (via proxy logs)
+alert http any any -> any any (
+    msg:"C2-Sliver: Suspicous Keywords detected in HTTP POST via Proxy";
+    flow:to_server,established;
+    http.method; content:"POST";
+    http.uri; content:".php"; nocase;
+    http.user_agent; 
+    pcre:"/ICT|STAR|GUES|OVERORGANIZE|CONFERMENTS/i";
+    classtype:trojan-activity;
+    sid:1000401;
+    rev:2;
+)
+
+# Also check for these patterns in URL parameters
+alert http any any -> any any (
+    msg:"C2-Sliver: Pattern in URL or Headers";
+    flow:to_server;
+    http.uri; 
+    pcre:"/(?:ICT|STAR|GUES|OVERORGANIZE|CONFERMENTS)/i";
+    classtype:trojan-activity;
+    sid:1000402;
+    rev:1;
+)
+# DNS exfiltration patterns common to Sliver
+alert dns any any -> any any (
+    msg:"C2-Sliver: High entropy/long subdomain (possible data exfil)";
+    dns.query;
+    pcre:"/^[a-zA-Z0-9]{20,}\./";
+    classtype:trojan-activity;
+    sid:1000403;
+    rev:1;
+)
+
+alert dns any any -> any any (
+    msg:"C2-Sliver: Suspicious TXT record query";
+    dns.query; isdataat:!1,relative;
+    dns.type; content:"16";  # TXT records
+    classtype:trojan-activity;
+    sid:1000404;
+    rev:1;
+)
+
+alert tls any any -> any any (
+    msg:"C2-Sliver: Suspicious SSL/TLS Cert Pattern";
+    tls.subject;
+    pcre:"/(?:sliver|c2|implant|beacon|command)\.(?:local|lan|internal)/i";
+    classtype:trojan-activity;
+    sid:1000405;
+    rev:1;
+)
+
+alert dns any any -> any 53 (
+    msg:"CALAMARI: DNS Tunneling - High Query-to-Response Ratio";
+    dns.opcode:0;
+
+    # Look for unusual query types commonly used in tunneling
+    dns.type; content:"01";  # A
+    dns.type; content:"1C";  # AAAA
+    dns.type; content:"10";  # TXT
+
+    # High entropy detection
+    dns.query; pcre:"/[a-f0-9]{16,}\./";
+
+    threshold:type both, track by_src, count 20, seconds 60;
+    classtype:protocol-command-decode;
+    sid:1000023;
+    rev:1;
+)
+
+alert dns any any -> any 53 (
+    msg:"CALAMARI: Unusual DNS Query Type";
+
+    # Uncommon query types for typical user behavior
+    dns.type; content:"0F";  # MX
+    dns.type; content:"21";  # SRV
+    dns.type; content:"06";  # SOA
+
+    # But exclude from certain sources (like mail servers)
+    src_ip; !content:"$SMTP_SERVER";
+
+    classtype:misc-activity;
+    sid:1000024;
+    rev:1;
+)
+
+alert dns any 53 -> any any (
+    msg:"CALAMARI: Fast Flux DNS - Rapid IP Changes";
+
+    # Track A record changes for same domain
+    dns.type; content:"01";
+    dns.answer;
+
+    # This requires a flowbit to track across packets
+    flowbits:set,fastflux_domain;
+    flowbits:noalert;
+
+    threshold:type both, track by_src, count 5, seconds 10;
+
+    classtype:bad-unknown;
+    sid:1000025;
+    rev:1;
+)
+
+# Detect DNS query without subsequent proxy traffic (data exfiltration)
+alert dns any any -> any 53 (
+    msg:"CALAMARI: DNS Query Without Proxy Follow-up - Possible Exfiltration";
+    dns.opcode:0;
+
+    # Set flowbit on DNS query
+    flowbits:set,dns_query_no_http;
+    flowbits:noalert;
+
+    sid:1000026;
+    rev:1;
+)
+
+# Companion rule checking HTTP traffic
+alert http any any -> any any (
+    msg:"CALAMARI: No HTTP after DNS - Data Exfil Suspected";
+    flowbits:isset,dns_query_no_http;
+    flow:to_server;
+
+    # Check if HTTP happens within time window
+    threshold:type limit, track by_src, seconds 300, count 0;
+
+    classtype:bad-unknown;
+    sid:1000027;
+    rev:1;
+)
+
+alert dns any any -> any 53 (
+    msg:"CALAMARI: Possible DGA Domain Query";
+    dns.opcode:0;
+
+    # Check for high entropy domain names
+    dns.query; pcre:"/^[a-z]{10,20}\.(com|net|org|info|biz)$/";
+
+    # Calculate approximate entropy (simple version)
+    dns.query; pcre:"/[aeiou]{0,3}[bcdfghjklmnpqrstvwxyz]{5,}/i";
+
+    # NXDOMAIN responses are common with DGAs
+    dns.rcode; content:"03";  # NXDOMAIN
+
+    threshold:type both, track by_src, count 10, seconds 600;
+    classtype:trojan-activity;
+    sid:1000028;
+    rev:1;
+)
+
+# Detects >30 DNS queries in 60 seconds. Good for catching beaconing.
+# Detects long subdomains (>25 chars). Good for data exfiltration.
+# Detects large responses (>100 bytes). Good for C2 command delivery.
+
+alert udp any any -> any 53 (msg:"Sliver: Possible DNS Tunnel detected, re-use of suspicious dns.id 0400";
+
+content:"|04 00|"; offset:0; depth:2;
+
+threshold:type both, track by_src, count 5, seconds 60;
+
+classtype:trojan-activity; sid:10000027; rev:1;)
+
+(1)
+alert dns any any -> any 53 (msg:"Multiple Huge amount of DNS-Queries possibel C2-Channel or exfiltration detected";
+
+dns.opcode:0;
+threshold:type both, track by_src, count 30, seconds 60;
+
+sid:1000020; rev:1;)
+
+
+(2)
+alert dns any any -> any 53 (msg:"Multiple DNS Query Length exceeds 25 characters, possible C2-Channel or exfiltration detected";
+
+dns.opcode:0; dns.query; bsize:>25;
+threshold:type both, track by_src, count 10, seconds 60;
+
+sid:1000021; rev:1;)
+
+
+(3)
+alert dns any 53 -> any any (msg:"Multiple DNS Answer to single Host exceeds 100 Byte, possible C2-Channel detected";
+
+dsize:>=100;
+threshold:type both, track by_dst, count 10, seconds 60;
+
+sid:1000022; rev:1;)
+
+
+
+# Add to /etc/suricata/rules/havoc-c2.rules
+
+# these are default values in Havoc, but you may use them to catch low-hanging fruit
+alert http any any -> any 80 (
+    msg:"C2-Havoc: Suspicious HTTP Default Parameters";
+    http.method; content:"POST";
+    http.uri; content:"/"; urilen:1;
+    http.content_type; content:"*/*";
+    threshold:type both, track by_src, count 10, seconds 60;
+    sid:1000404; rev:1;
+)
+
+
+
+# Summarizing, this combination of flowbits triggers, if 10 POST requests have been
+# seen within 60 seconds without any GET requests in the same connection.
+
+(1.)
+alert http any any -> any 80 (msg:"HTTP POST flow detected";
+
+flow:to_server,established;
+http.method; content:"POST";
+flowbits:set,http_post; flowbits:noalert;
+
+sid:1000401; rev:1;)
+
+
+(2.)
+alert http any any -> any 80 (msg:"HTTP GET request in flow detected";
+
+flow:to_server,established;
+http.method; content:"GET";
+flowbits:set,non_http_post; flowbits:unset,http_post; flowbits:noalert;
+
+sid:1000402; rev:1;)
+
+
+(3.)
+alert ip any any -> any any (msg:"Flow with only HTTP POST requests";
+
+flow:to_server,established;
+flowbits:isset,http_post; flowbits:isnotset,non_http_post;
+
+threshold:type both, track by_src, count 10, seconds 60;
+
+sid:1000403; rev:2;)
