@@ -96,7 +96,7 @@ _install_deps()
             if ! grep -q ^address=/$domain/127.0.0.1 $dns_conf ; then
                 echo "not found in dnsmasq.conf"
                 find_pattern="#address=/www.thekelleys.org.uk/fe80::20d:60ff:fe36:f83"
-                replace_with="$find_pattern\naddress/$domain/127.0.0.1"
+                replace_with="$find_pattern\naddress=/$domain/127.0.0.1"
                 sed -i 's_'$find_pattern'_'$replace_with'_' $dns_conf
             else
                 echo "is already blocked"
