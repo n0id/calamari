@@ -91,17 +91,16 @@ _install_deps()
         restart_dnsmasq=1
     fi
     if [ -f "$BLACKLIST" ] ; then
+        reload=0
         for domain in $( cat $BLACKLIST | sed 's/^\.//g' ) ; do
-            echo -n "$domain "
             if ! grep -q ^address=/$domain/127.0.0.1 $dns_conf ; then
-                echo "not found in dnsmasq.conf"
                 find_pattern="#address=/www.thekelleys.org.uk/fe80::20d:60ff:fe36:f83"
                 replace_with="$find_pattern\naddress=/$domain/127.0.0.1"
                 sed -i 's_'$find_pattern'_'$replace_with'_' $dns_conf
-            else
-                echo "is already blocked"
+                reload=1
             fi
         done
+        test $reload -gt 0 && service dnsmasq reload
     fi
     if ! grep -q ^log-queries "$dns_conf"; then
         cp "$dns_conf" "${dns_conf}.backup.$(date +%Y%m%d)"
