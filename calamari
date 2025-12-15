@@ -4,6 +4,8 @@ set -e
 # Applies a highly restrictive network setup in which only squid (80,443), dnsmasq (53) and chrony (123)
 # are allowed outgoing external network access.
 # This is facilitated via the iptables --uid-owner $USER [dnsmasq|_chrony|proxy]
+# @TODO Add a top data usasge report based on column #2 in access.log 
+# @TODO Extend 'install' command to interface; copies script to /usr/bin/ after running _install_deps
 
 PROJDIR="$( realpath $0 | xargs dirname )"
 DEFAULT_ROUTE=$(ip route | grep '^default' | head -1)
@@ -585,12 +587,14 @@ case "$1" in
         echo "${ret}" | less -RS
         read -p "Provide index number to block that domain: " F_INPUT
         if [ -n "$F_INPUT" ] ; then
-            domain="$(echo "${ret}" | awk '/^'$F_INPUT' / { print $3 }' | cut -d: -f1)"
-            # @TODO - allow sub-domains to be removed
-            echo -n "Blocking domain ${domain}.."
-            deny_domain $domain -n
-            echo ". done. This can be removed with $0 allow ${domain}."
-            echo "WARNING - remember to restart squid with: \$ service squid restart"
+            domain="$(echo "${ret}" | awk '/^'$F_INPUT' / { print $3 }' | cut -d: -f1 | tr -d ' ' )"
+            if [ -n "${domain}" ] ; then 
+                # @TODO - allow sub-domains to be removed
+                echo -n "Blocking domain ${domain}.."
+                deny_domain $domain -n
+                echo ". done. This can be removed with $0 allow ${domain}."
+                echo "WARNING - remember to restart squid with: \$ service squid restart"
+            fi
         fi
         ;;
     squid-denied-domains|squid-denied-domains)
