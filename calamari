@@ -59,17 +59,21 @@ _install_deps()
 
     local squid_conf="/etc/squid/squid.conf"
     if [ -f "$squid_conf" ]; then
-        local new_squid_conf="${PROJDIR}/config/squid.conf.example"
-        if ! cmp --silent $squid_conf "$new_squid_conf"; then
+        _print_squid_conf > /tmp/.calamari_squid.conf
+
+        if ! cmp --silent $squid_conf /tmp/.calamari_squid.conf; then
             echo "Current Squid config file doesn't match calamari settings."
             read -p "Replace it? (y/n): " F_INPUT
+
             if [ "${F_INPUT}" = "y" ] || [ "${F_INPUT}" = "Y" ]; then
                 cp $squid_conf $squid_conf".orig"
-                cp "${PROJDIR}/config/squid.conf.example" $squid_conf
+                mv /tmp/.calamari_squid.conf $squid_conf
                 local blacklist_file="$( dirname $squid_conf )/blacklist_domains.txt"
+
                 if [ ! -f "${blacklist_file}" ]; then
                     cp "${PROJDIR}/config/blacklist_domains.txt" "$( dirname $squid_conf )"
                 fi
+
                 _setup_squid_auth
                 echo -n "Restarting squid..."
                 service squid restart
@@ -139,7 +143,20 @@ _prompt_allow_ssh_user()
     fi
 }
 
-_setup_squid_auth() {
+_disable_ipv6()
+{
+    sysctl -w net.ipv6.conf.all.disable_ipv6=1
+    sysctl -w net.ipv6.conf.default.disable_ipv6=1
+}
+
+_enable_ipv6()
+{
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0
+}
+
+_setup_squid_auth()
+{
     _require_root
     local auth_type="basic"
     local passwd_file="/etc/squid/passwords"
@@ -167,11 +184,11 @@ _setup_squid_auth() {
     # Remove auth lines
     sed -i 's/^#auth_param/auth_param/' "$squid_conf"
     sed -i 's/^#acl authenticated/acl authenticated/' "$squid_conf"
-    #sed -i 's/^#http_access allow authenticated/http_access allow authenticated/' "$squid_conf"
     sed -i 's/^http_access allow localhost manager/http_access allow authenticated/' "$squid_conf"
 }
 
-_list_squid_users() {
+_list_squid_users()
+{
     local passwd_file="/etc/squid/passwords"
 
     if [ ! -f "$passwd_file" ]; then
@@ -184,6 +201,38 @@ _list_squid_users() {
     echo "Basic authentication users:"
     cut -d: -f1 "$passwd_file" | sort | uniq
     echo ""
+}
+
+_print_squid_conf()
+{
+echo "
+acl SSL_ports port 443
+acl Safe_ports port 80      # http
+acl Safe_ports port 443     # https
+
+#auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwords
+#auth_param basic realm proxy
+#acl authenticated proxy_auth REQUIRED
+
+acl domain_blacklist dstdomain "/etc/squid/blacklist_domains.txt"
+
+http_access deny all domain_blacklist
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+http_access allow localhost manager
+http_access deny manager
+http_access allow localhost
+http_access deny to_localhost
+http_access deny to_linklocal
+
+http_access deny all
+
+http_port 127.0.0.1:3128
+dns_nameservers 127.0.0.1
+
+coredump_dir /var/spool/squid
+refresh_pattern .       0   20% 4320
+"
 }
 
 
@@ -270,7 +319,7 @@ deny_domain()
     if [ "$?" != "0" ]; then
         echo "WARNING: failed to blacklist $1"
         exit 1
-    else
+    elif [ -z "${2}" ] || [ "${2}" != "-n" ]; then 
         _prompt_squid_restart "Squid must restart for changes to be appplied."
     fi
 }
@@ -408,6 +457,7 @@ apply_live()
 {
     _install_deps
     remove_live > /dev/null 2>&1
+    _disable_ipv6
     yes | ufw reset > /dev/null 2>&1
     ufw enable > /dev/null 2>&1
 
@@ -475,12 +525,17 @@ apply_live()
     iptables -A $DENY_CHAIN -j DROP
 
     _start_required_services
-    echo "Locked-down mode is now ACTIVE (non-persistent – reboot to remove)"
+    if [ "$1" = "tor" ]; then
+        echo "Locked-down mode using TOR is now ACTIVE (non-persistent – reboot to remove)"
+    else
+        echo "Locked-down mode is now ACTIVE (non-persistent – reboot to remove)"
+    fi
 }
 
 remove_live()
 {
     _require_root
+    _enable_ipv6
     echo "Removing temporary locked-down rules..."
     iptables -D ufw-before-output -o "$INTERFACE" -j $ALLOW_CHAIN 2>/dev/null || true
     iptables -D ufw-before-output -o "$INTERFACE" -j $DENY_CHAIN  2>/dev/null || true
@@ -526,7 +581,17 @@ case "$1" in
         ;;
     squid-top-domains|squidtopdomains)
         _require_access_log
-        print_top_domains $2 $3
+        ret="$(print_top_domains $2 $3)"
+        echo "${ret}" | less -RS
+        read -p "Provide index number to block that domain: " F_INPUT
+        if [ -n "$F_INPUT" ] ; then
+            domain="$(echo "${ret}" | awk '/^'$F_INPUT' / { print $3 }' | cut -d: -f1)"
+            # @TODO - allow sub-domains to be removed
+            echo -n "Blocking domain ${domain}.."
+            deny_domain $domain -n
+            echo ". done. This can be removed with $0 allow ${domain}."
+            echo "WARNING - remember to restart squid with: \$ service squid restart"
+        fi
         ;;
     squid-denied-domains|squid-denied-domains)
         _require_access_log
