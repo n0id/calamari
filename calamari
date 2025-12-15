@@ -4,8 +4,6 @@ set -e
 # Applies a highly restrictive network setup in which only squid (80,443), dnsmasq (53) and chrony (123)
 # are allowed outgoing external network access.
 # This is facilitated via the iptables --uid-owner $USER [dnsmasq|_chrony|proxy]
-# @TODO Add a top data usasge report based on column #2 in access.log 
-# @TODO Extend 'install' command to interface; copies script to /usr/bin/ after running _install_deps
 
 PROJDIR="$( realpath $0 | xargs dirname )"
 DEFAULT_ROUTE=$(ip route | grep '^default' | head -1)
@@ -70,10 +68,8 @@ _install_deps()
             if [ "${F_INPUT}" = "y" ] || [ "${F_INPUT}" = "Y" ]; then
                 cp $squid_conf $squid_conf".orig"
                 mv /tmp/.calamari_squid.conf $squid_conf
-                local blacklist_file="$( dirname $squid_conf )/blacklist_domains.txt"
-
-                if [ ! -f "${blacklist_file}" ]; then
-                    cp "${PROJDIR}/config/blacklist_domains.txt" "$( dirname $squid_conf )"
+                if [ ! -f "${BLACKLIST}" ]; then
+                    cp "${PROJDIR}/config/blacklist_domains.txt" "$BLACKLIST"
                 fi
 
                 _setup_squid_auth
@@ -91,8 +87,21 @@ _install_deps()
         exit 1
     fi
     if ! grep -q ^server= "$dns_conf"; then
-        sed -i 's/# server=10.1.2.3@eth1/server=8.8.8.8/' "$dns_conf"
+        sed -i 's/# server=10.1.2.3@eth1/# server=10.1.2.3@eth1\nserver=8.8.8.8/' "$dns_conf"
         restart_dnsmasq=1
+    fi
+    if [ -f "$BLACKLIST" ] ; then
+        for domain in $( cat $BLACKLIST | sed 's/^\.//g' ) ; do
+            echo -n "$domain "
+            if ! grep -q ^address=/$domain/127.0.0.1 $dns_conf ; then
+                echo "not found in dnsmasq.conf"
+                find_pattern="#address=/www.thekelleys.org.uk/fe80::20d:60ff:fe36:f83"
+                replace_with="$find_pattern\naddress/$domain/127.0.0.1"
+                sed -i 's_'$find_pattern'_'$replace_with'_' $dns_conf
+            else
+                echo "is already blocked"
+            fi
+        done
     fi
     if ! grep -q ^log-queries "$dns_conf"; then
         cp "$dns_conf" "${dns_conf}.backup.$(date +%Y%m%d)"
@@ -216,7 +225,7 @@ acl Safe_ports port 443     # https
 #auth_param basic realm proxy
 #acl authenticated proxy_auth REQUIRED
 
-acl domain_blacklist dstdomain "/etc/squid/blacklist_domains.txt"
+acl domain_blacklist dstdomain "$BLACKLIST"
 
 http_access deny all domain_blacklist
 http_access deny !Safe_ports
