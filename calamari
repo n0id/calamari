@@ -1,6 +1,8 @@
 #!/bin/sh
 set -e
 
+# @TODO - unchatter /etc/resolv.conf and restore it, or undo dnsmasq changes
+
 # Applies a highly restrictive network setup in which only squid (80,443), dnsmasq (53) and chrony (123)
 # are allowed outgoing external network access.
 # This is facilitated via the iptables --uid-owner $USER [dnsmasq|_chrony|proxy]
@@ -59,7 +61,11 @@ _install_deps()
 
     local squid_conf="/etc/squid/squid.conf"
     if [ -f "$squid_conf" ]; then
-        _print_squid_conf > /tmp/.calamari_squid.conf
+        if [ -n "$( uname -a | grep -i 'devuan' )" ]; then
+            _print_squid_conf | sed '/^http_access deny to_linklocal//' > /tmp/.calamari_squid.conf
+        else
+            _print_squid_conf > /tmp/.calamari_squid.conf
+        fi
 
         if ! cmp --silent $squid_conf /tmp/.calamari_squid.conf; then
             echo "Current Squid config file doesn't match calamari settings."
@@ -231,7 +237,6 @@ http_access deny !Safe_ports
 http_access deny CONNECT !SSL_ports
 http_access allow localhost manager
 http_access deny manager
-http_access allow localhost
 http_access deny to_localhost
 http_access deny to_linklocal
 
