@@ -2,6 +2,8 @@
 set -e
 
 # @TODO - unchatter /etc/resolv.conf and restore it, or undo dnsmasq changes
+# @TODO - move google, cloudflare/cloudfront dns and squid blocklist into their own 'full' version of blocklist
+#         and allow the user to toggle between the 'full list' and a more permissive list.
 
 # Applies a highly restrictive network setup in which only squid (80,443), dnsmasq (53) and chrony (123)
 # are allowed outgoing external network access.
@@ -518,6 +520,9 @@ apply_live()
             echo "Check: service tor status"
             exit 1
         fi
+
+        # TODO - if the network interface hasn't completed it's 'up' status, these commands will fail and exit the script
+        # Check if-up and issue sleep 1sec command otherwise to avoid bailing out early
 
         iptables -A $ALLOW_CHAIN -o "$INTERFACE" -m owner --uid-owner $tor_user -j ACCEPT
     else
